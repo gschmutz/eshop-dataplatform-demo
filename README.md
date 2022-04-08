@@ -383,6 +383,8 @@ In the 4th step, we will be using [Apache Spark](https://spark.apache.org/) to p
 
 Navigate to <http://dataplatform:28080> to open Apache Zeppelin and login as user `admin` with password `abc123!`. Create a new notebook using the **Create new note** link.
 
+### Working with Raw Data
+
 Now let's read all the data we have stored to MinIO object storage so far, using the `spark.read.format("avro").load` command
 
 ```scala
@@ -537,6 +539,7 @@ val pHour = "20"
 val orderFilteredRawDf = orderRawDf.where(col("year") === pYear and col("month") === pMonth and col("day") === pDay and col("hour") === pHour)
 ```
 
+### Registering as Spark SQL tables
 
 Spark SQL allows to use the SQL language to work on the data in a data frame. We can register a table on a data frame.
 
@@ -573,9 +576,53 @@ ON (ord.orderID = ordi.orderId)
 ```
 
 
+### Refinement
 
+```sql
+%sql
+SELECT BIGINT(TerritoryID)   as territory_id
+,   BIGINT(BillToAddressID)  as bill_to_address_id
+,   BIGINT(ShipToAddressID)  as ship_to_address_id
+,   INT(CurrencyRateID)      as currency_rate_id
+,   BIGINT(SubTotal)         as sub_total
+,   DOUBLE(TaxAmt)           as tax_amt
+,   DOUBLE(Freight)          as freight
+,   DOUBLE(TotalDue)         as total_due
+,   BIGINT(orderId)          as order_id
+,   BIGINT(businessEntityID) as  business_entity_id
+,   year
+,   month
+,   day
+,   hour
+FROM order_raw_t
+```
 
+```scala
+val orderRefinedDf = spark.sql("""
+SELECT BIGINT(TerritoryID)   as territory_id
+,   BIGINT(BillToAddressID)  as bill_to_address_id
+,   BIGINT(ShipToAddressID)  as ship_to_address_id
+,   INT(CurrencyRateID)      as currency_rate_id
+,   BIGINT(SubTotal)         as sub_total
+,   DOUBLE(TaxAmt)           as tax_amt
+,   DOUBLE(Freight)          as freight
+,   DOUBLE(TotalDue)         as total_due
+,   BIGINT(orderId)          as order_id
+,   BIGINT(businessEntityID) as  business_entity_id
+,   year
+,   month
+,   day
+,   hour
+FROM order_raw_t
+""")
 
+orderRefinedDf.printSchema
+""")
+```
+
+```scala
+orderRawDf.write.partitionBy("year", "month", "day", "hour").parquet("s3a://datalake-demo-bucket/refined/order")
+```
 
 
 
@@ -657,17 +704,23 @@ MSCK REPAIR TABLE order_raw_t SYNC PARTITIONS;
 MSCK REPAIR TABLE order_item_raw_t SYNC PARTITIONS;
 ```
 
+Create Tables on Refined data
+
+```sql
 DROP TABLE IF EXISTS order_t;
-CREATE EXTERNAL TABLE order_t (territory_id bigint, bill_to_address_id bigint, ship_to_address_id bigint, currency_rate_id int, sub_total bigint, tax_amt decimal(10,3), freight double, total_due double, order_id bigint, bussiness_entity_id bigint )
-PARTITIONED BY (year string, month string, day string, hour string)
+CREATE EXTERNAL TABLE order_t (territory_id bigint, bill_to_address_id bigint, ship_to_address_id bigint, currency_rate_id int, sub_total bigint, tax_amt double, freight double, total_due double, order_id bigint, bussiness_entity_id bigint )
+PARTITIONED BY (year int, month int, day int, hour int)
 STORED AS PARQUET
 LOCATION 's3a://datalake-demo-bucket/refined/order';  
+```
 
 
+```sql
 DROP TABLE IF EXISTS address_t;
 CREATE EXTERNAL TABLE address_t (address_id bigint, address_line_1 string, city string, state_province_id string, postal_code string, person_id bigint)
 STORED AS PARQUET
 LOCATION 's3a://datalake-demo-bucket/refined/address';  
+```
 
 
 PARTITIONED BY (year string, month string, day string, hour string)
