@@ -175,6 +175,8 @@ or view it in Kafka Connect UI by navigating to http://dataplatform:28103
 
 ## Moving Data from Kafka to S3 compliant Object Storage using StreamSets DataCollector
 
+**Note:** this has been replaced by Kafka Connect, as it does not proper batching on the S3 objects (very small objects).
+
 In the 2nd step, we will be using [StreamSets Data Collector](https://streamsets.com/products/dataops-platform/data-collector/) to consume the data we have previously written to the Kafka topic and store it in minIO Object Storage (which is S3 compliant).
 
 ![Alt Image Text](./images/use-case-step2.png "Use Case Step 2")
@@ -242,16 +244,73 @@ docker exec -it ksqldb-cli ksql http://ksqldb-server-1:8088
 Now we have to tell ksqlDB the structure of the data in the topic, as the Kafka topic itself is "schema-less", the Kafka cluster doesn't know about the structure of the message. We do that by creating a STREAM object, which we map onto the Kafka topic `tweet-json`.
 
 ```sql
-CREATE STREAM order_s
+CREATE STREAM order_raw_s
 WITH (KAFKA_TOPIC='order-v1', VALUE_FORMAT='AVRO');
+
+CREATE STREAM order_item_raw_s
+WITH (KAFKA_TOPIC='orderitem-v1', VALUE_FORMAT='AVRO');
+
+CREATE STREAM person_raw_s
+WITH (KAFKA_TOPIC='person-v1', VALUE_FORMAT='AVRO');
+
+CREATE STREAM address_raw_s
+WITH (KAFKA_TOPIC='address-v1', VALUE_FORMAT='AVRO');
 ```
+
+```sql
+describe order_raw_s;
+
+Name                 : ORDER_RAW_S
+ Field            | Type            
+------------------------------------
+ TERRITORYID      | VARCHAR(STRING)
+ BILLTOADDRESSID  | VARCHAR(STRING)
+ SHIPTOADDRESSID  | VARCHAR(STRING)
+ CURRENCYRATEID   | VARCHAR(STRING)
+ SUBTOTAL         | VARCHAR(STRING)
+ TAXAMT           | VARCHAR(STRING)
+ FREIGHT          | VARCHAR(STRING)
+ TOTALDUE         | VARCHAR(STRING)
+ ORDERID          | VARCHAR(STRING)
+ BUSINESSENTITYID | VARCHAR(STRING)
+ EVENTTIMESTAMP   | BIGINT          
+------------------------------------
+For runtime statistics and query details run: DESCRIBE <Stream,Table> EXTENDED;
+```
+
+```sql
+ksql> describe order_item_raw_s;
+
+Name                 : ORDER_ITEM_RAW_S
+ Field             | Type            
+-------------------------------------
+ PRODUCTID         | VARCHAR(STRING)
+ NAME              | VARCHAR(STRING)
+ PRODUCTNUMBER     | VARCHAR(STRING)
+ MAKEFLAG          | VARCHAR(STRING)
+ FINISHEDGOODSFLAG | VARCHAR(STRING)
+ COLOR             | VARCHAR(STRING)
+ SAFETYSTOCKLEVEL  | VARCHAR(STRING)
+ REORDERPOINT      | VARCHAR(STRING)
+ STANDARDCOST      | VARCHAR(STRING)
+ LISTPRICE         | VARCHAR(STRING)
+ DAYSTOMANUFACTURE | VARCHAR(STRING)
+ SELLSTARTDATE     | VARCHAR(STRING)
+ ROWGUID           | VARCHAR(STRING)
+ MODIFIEDDATE      | VARCHAR(STRING)
+ ORDERID           | VARCHAR(STRING)
+ EVENTTIMESTAMP    | BIGINT          
+-------------------------------------
+For runtime statistics and query details run: DESCRIBE <Stream,Table> EXTENDED;
+```
+
 
 We don't map all the properties of the tweet, only some we are interested in.
 
 Now with the STREAM in place, we can use the SELECT statement to query from it
 
 ```sql
-SELECT * FROM tweet_json_s EMIT CHANGES;
+SELECT * FROM order_raw_s EMIT CHANGES;
 ```
 
 We have to specify the emit changes, as we are querying from a stream and by that the data is continuously pushed into the query (so called push query).
@@ -259,64 +318,58 @@ We have to specify the emit changes, as we are querying from a stream and by tha
 We can also selectively only return the data we are interested in, i.e. the `id`, the `text` and the `source` fields.
 
 ```sql
-SELECT id, text, source FROM tweet_json_s EMIT CHANGES;
+SELECT subtotol, orderid FROM order_raw_s EMIT CHANGES;
 ```
 
-Let's work with some nested fields. Inside the `entities` structure there is a `user_mentions` array, which holds all the users being mentioned in a tweet.
+Let's only see the orders which are > 5000. We have to cast to double because we are using the raw data.
 
 ```sql
-SELECT text, entities->user_mentions
-FROMINS
+SELECT subtotal, orderid FROM order_raw_s WHERE cast(subtotal AS DOUBLE) > 10000.00 EMIT CHANGES;
 ```
 
-With that we can easily check the array for all the tweets where `@realDonaldTrump` is mentioned
+We can refine the data
+
 
 ```sql
-SELECT id
-		, text
-FROM tweet_json_s
-WHERE array_contains(entities-> user_mentions, STRUCT(screen_name :='realDonaldTrump')) = true  
-EMIT CHANGES;
-```
-
-In the `entities` structure, there is also a `hashtags` array, which lists all the hashtags used in a tweet.
-
-
-Let's say we want to produce trending hashtags over a given time. In KSQL, we also have a way to do aggregations with the `SELECT COUNT(*) FROM ... GROUP BY` statement, similar to using it with relational databases.
-
-In order to use that, we first have to flatten the array, so we only have one hashtag per result. We can do that using the `EXPLODE` function
-
-```sql
-SELECT id
-	, text
-	, EXPLODE(entities->hashtags)->text AS hashtag
-FROM tweet_json_s
-EMIT CHANGES;
-```
-
-Unfortunately we can't use the `EXPLODE` function in the `GROUP BY`, so we first have to produce the flattened result into a new Stream (with an other Kafka Topic behind) and then do the aggregation on that.
-
-```sql
-CREATE STREAM tweet_hashtag_s
-WITH (kafka_topic='tweet_hashtag')
+CREATE STREAM order_s
+WITH (kafka_topic='ref.order_v1', partitions=8, value_format = 'avro')
 AS
-SELECT id
-	, text
-	, EXPLODE(entities->hashtags)->text AS hashtag
-FROM tweet_json_s
+SELECT CAST (TERRITORYID AS int)      AS territory_id
+,   CAST(BILLTOADDRESSID AS bigint)   AS bill_to_address_id
+,   CAST(SHIPTOADDRESSID AS bigint)   AS ship_to_address_id
+,   CAST(CURRENCYRATEID AS bigint)    AS currency_rate_id
+,   CAST(SUBTOTAL AS double)          AS sub_total
+,   CAST(TAXAMT AS double)            AS tax_amt
+,   CAST(FREIGHT AS double)           AS freight
+,   CAST(TOTALDUE AS double)          AS total_due
+,   CAST(ORDERID AS bigint)           AS order_id
+FROM order_raw_s;
+```
+
+This produces a Stream Analytics job which now continuously run in the background and read from the `order_raw_s`, flattens the hashtags and produces the result into the newly created `order_s` stream.
+
+
+```sql
+SELECT sub_total, order_id FROM order_s WHERE sub_total  > 10000.00 EMIT CHANGES;
+```
+
+
+
+```sql
+SELECT productid
+	, count(*) AS count
+FROM order_item_raw_s
+WINDOW TUMBLING (SIZE 60 seconds)
+GROUP BY productid
 EMIT CHANGES;
 ```
 
-This produces a Stream Analytics job which now continuously run in the background and read from the `tweet_json_s`, flattens the hashtags and produces the result into the newly created `tweet_hashtag_s` stream.
-
-On that new stream we can now do aggregation. Because a stream is unbounded, we have to specify a window over which the aggregation should take place. We are using a 1 minute window.
-
 ```sql
-SELECT hashtag
+SELECT productid
 	, count(*) AS count
-FROM tweet_hashtag_s
+FROM order_item_raw_s
 WINDOW TUMBLING (SIZE 60 seconds)
-GROUP BY hashtag
+GROUP BY productid
 EMIT FINAL;
 ```
 
@@ -527,20 +580,6 @@ ON (ord.orderID = ordi.orderId)
 
 
 
-
-Let's say this is the result we want to make available. We can now turn it into a spark statement by placing it inside the `spark.sql` method call.
-
-```scala
-val resultDf = spark.sql("""
-    SELECT hashtag, COUNT(*) nof
-    FROM (
-	    SELECT LOWER(hashtag.text) AS hashtag
-	    FROM tweets LATERAL VIEW EXPLODE(entities.hashtags) hashtags AS hashtag )
-	    GROUP BY hashtag
-    ORDER BY nof desc
-""")
-```
-
 The result of the `spark.sql` is another, new data frame, which we can either do further processing on, or store it using the `write.parquet` method
 
 ```scala
@@ -591,17 +630,18 @@ STORED AS INPUTFORMAT 'org.apache.hadoop.hive.ql.io.avro.AvroContainerInputForma
 LOCATION 's3a://datalake-demo-bucket/raw/order-v1'
 TBLPROPERTIES ('avro.schema.url'='s3a://datalake-demo-bucket/avro/Order-v1.avsc','discover.partitions'='true');  
 
-
+DROP TABLE address_raw_t;
 CREATE EXTERNAL TABLE address_raw_t
+PARTITIONED BY (year string, month string, day string, hour string)
 ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.avro.AvroSerDe'
 STORED AS INPUTFORMAT 'org.apache.hadoop.hive.ql.io.avro.AvroContainerInputFormat'
   OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.avro.AvroContainerOutputFormat'
-LOCATION 's3a://datalake-demo-bucket/raw/order-v1'
-TBLPROPERTIES ('avro.schema.url'='s3a://datalake-demo-bucket/avro/Order-v1.avsc','discover.partitions'='true');  
+LOCATION 's3a://datalake-demo-bucket/raw/address-v1'
+TBLPROPERTIES ('avro.schema.url'='s3a://datalake-demo-bucket/avro/Address-v1.avsc','discover.partitions'='true');  
 
 
 
-CREATE EXTERNAL TABLE orderitem_raw_t
+CREATE EXTERNAL TABLE order_item_raw_t
 PARTITIONED BY (year string, month string, day string, hour string)
 ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.avro.AvroSerDe'
 STORED AS INPUTFORMAT 'org.apache.hadoop.hive.ql.io.avro.AvroContainerInputFormat'
@@ -612,12 +652,28 @@ TBLPROPERTIES ('avro.schema.url'='s3a://datalake-demo-bucket/avro/OrderItem-v1.a
 
 
 ```sql
+MSCK REPAIR TABLE address_raw_t SYNC PARTITIONS;
 MSCK REPAIR TABLE order_raw_t SYNC PARTITIONS;
+MSCK REPAIR TABLE order_item_raw_t SYNC PARTITIONS;
 ```
 
-DROP TABLE IF EXISTS address_raw_t;
-CREATE EXTERNAL TABLE address_raw_t (hashtag string, nof integer)
-STORED AS PARQUET LOCATION 's3a://datalake-demo-bucket/raw/address-v1';  
+DROP TABLE IF EXISTS order_t;
+CREATE EXTERNAL TABLE order_t (territory_id bigint, bill_to_address_id bigint, ship_to_address_id bigint, currency_rate_id int, sub_total bigint, tax_amt decimal(10,3), freight double, total_due double, order_id bigint, bussiness_entity_id bigint )
+PARTITIONED BY (year string, month string, day string, hour string)
+STORED AS PARQUET
+LOCATION 's3a://datalake-demo-bucket/refined/order';  
+
+
+DROP TABLE IF EXISTS address_t;
+CREATE EXTERNAL TABLE address_t (address_id bigint, address_line_1 string, city string, state_province_id string, postal_code string, person_id bigint)
+STORED AS PARQUET
+LOCATION 's3a://datalake-demo-bucket/refined/address';  
+
+
+PARTITIONED BY (year string, month string, day string, hour string)
+STORED AS PARQUET LOCATION 's3a://datalake-demo-bucket/refined/order';  
+
+MSCK REPAIR TABLE order_t SYNC PARTITIONS;
 ```
 
 With the table in place, we can quit the CLI using the `exit;` command.
